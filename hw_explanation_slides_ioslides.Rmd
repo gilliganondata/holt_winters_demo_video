@@ -1,0 +1,636 @@
+---
+title: "KPI Movement: Signal or Noise?"
+subtitle: "Using Holt-Winters forecasting to determine when to dig further"
+author: "Tim Wilson (with narration by Amazon Polly)"
+output: 
+  ioslides_presentation:
+    css: styles.css
+---
+
+<!--
+This presentation provides a high-level explanation of how the Holt-Winters forecasting method 
+can be used to objectively assess if a metric has moved enough to warrant further investigation. 
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+library(tidyverse)
+library(googleAnalyticsR)
+library(knitr)
+library(forecast)   # This is how we're going to build the forecast
+library(lubridate)
+
+source("./scripts/themes_ref.R")   # Get theme definitions
+
+# Load the client ID, client secret, and GA view ID
+client_id <- Sys.getenv("GA_CLIENT_ID")
+client_secret <- Sys.getenv("GA_CLIENT_SECRET")
+
+# Set the client ID and client secret as options for googleAuthR
+options(googleAuthR.client_id = client_id)
+options(googleAuthR.client_secret = client_secret)
+
+# Reload the googleAnalyticsR package so those options get set in googleAuthR
+devtools::reload(pkg = devtools::inst("googleAnalyticsR"))
+
+# Authorize GA. Depending on if you've done this already and a .httr-oauth file has
+# been saved or not, this may pop you over to a browser to authenticate.
+ga_auth()
+
+# Get the view ID and set the date range to be worked with.
+view_id <- Sys.getenv("GA_VIEW_ID")
+start_date <- "2017-02-19"
+end_date <- "2017-04-08"
+
+metric <- "sessions"
+dimension <- "date"  # Set this to day or week. This hasn't been vetted for anything other than "date"
+
+# Set the number of time periods to be checked. These will be the "last X rows" in
+# the data that gets pulled
+check_periods <- 7
+
+# Set the frequency of the time series. If dimensions is "date," then this should be 7.
+# This doesn't currently work for anything other than daily data
+ts_freq <- 7
+
+# Set the level for the prediction interval
+interval_level <- 0.95
+
+# Get the data
+ga_data <- google_analytics_4(view_id,
+                              date_range = c(start_date, end_date),
+                              dimensions = dimension,
+                              metrics = metric)
+
+# Rename columns
+names(ga_data) <- c("time_period", metric)
+
+# Determine how many rows of the data will be used to build the forecast. This
+# is just ALL rows minus the number of periods to be checked
+rowcount_forecast <- nrow(ga_data) - check_periods
+
+# Also figure out the date where the cutoff is between training and forecast
+cutoff_time_period <- ga_data[rowcount_forecast,1] 
+
+# We actually want to shift this over a little bit to fall between two points when we plot
+cutoff_time_period <- (2*as.numeric(cutoff_time_period) + 1)/2
+
+# Make a data set that removes the "rows to be evaluated." This will get 
+# used both to generate the time series for the forecast as well as for modeling
+ga_data_training <- ga_data %>%
+  top_n(-rowcount_forecast, wt = time_period) 
+
+# Get the time_period values for the forecast period
+time_periods_forecast <- ga_data %>%
+    top_n(check_periods, wt = time_period) %>%
+  select(time_period)
+
+# Make a time-series object using the data for the training period. This
+# is what we'll use to build the forecast
+ga_data_ts <- ga_data_training[[2]] %>%
+  ts(frequency = ts_freq)
+
+# Start building out our master data for plotting by adding a column that
+# has just the data being used for the training
+ga_data_plot <- ga_data %>%
+  left_join(ga_data_training, by = c(time_period = "time_period"))
+
+# Rename to generic names
+names(ga_data_plot) <- c("time_period", "metric_all", "metric_training")
+
+# Add a column that is just the actuals data of interest
+ga_data_plot <- ga_data_plot %>%
+  mutate(metric_assess = ifelse(is.na(metric_training), metric_all, NA))
+
+# Generate a Holt Winters forecast
+hw <- HoltWinters(ga_data_ts)
+
+# Predict the next 7 days (the 7 days of interest). Go ahead and convert it to a data frame
+forecast_metric <- predict(hw, n.ahead = 7, prediction.interval = T, interval_level = 0.95) %>%
+  as.data.frame()
+
+# Add in the dates so we can join this with the original data. We know it was the 7 days
+# starting from cutoff_date
+forecast_metric$time_period <- time_periods_forecast$time_period
+
+# Add these columns to the original data and add a column that IDs anomaly points by 
+# checking to see if the actual value is outside the upper or lower bounds. If it is,
+# If it is, put the value. We'll use this to highlight the anomalies.
+ga_data_plot <- ga_data_plot %>%
+  left_join(forecast_metric) %>%
+  mutate(anomaly = ifelse(metric_all < lwr | metric_all > upr, metric_all, NA))
+
+# Figure out the max value (for plotting) and then bump it up a bit
+max_y <- max(select(ga_data_plot, -time_period))
+
+```
+
+
+
+# A KPI Gets Reported
+
+<!--
+Consider a scenario where we're reporting a series of key performance indicators on a 
+regular basis. For this illustration, we're going to use just a single KPI. And,
+to really keep things simple, we're not even going to say what the metric uses -- 
+that's not actually relevant.
+-->
+
+# And It Includes Some Context...
+
+<!--
+The KPI will be reported with some context.
+-->
+
+# Comparison to a Target
+
+<!--
+Hopefully, that includes a comparison of the KPI to a target.
+-->
+
+# Comparison to an Earlier Period
+
+<!--
+And, it may include a comparison to the previous period or the same period last year.
+-->
+
+## And...Usually...A Trend of the Data
+
+```{r echo=FALSE, message=FALSE, warning = FALSE, fig.width = 8, fig.height = 4.75}
+
+# Make a weekly chart of the data
+
+# Aggregate the data to be weekly
+ga_data_weekly <- ga_data %>%
+  mutate(week = time_period - wday(time_period) + 1) %>% 
+  group_by(week) %>% 
+  summarise(sessions = sum(sessions)) %>% 
+  mutate(last_week_sessions = ifelse(week == max(week), sessions, NA ))
+
+# Chart it
+ga_plot_weekly <- ggplot(ga_data_weekly, mapping = aes(x = week, y = sessions)) +
+  geom_line(color = "#07077D", size = 1) +
+  geom_point(aes(y=sessions), size=3, shape = 19, colour = "#07077D") +
+  geom_point(aes(y=sessions), size=3, shape = 20, colour = "white") +
+  geom_point(aes(y=last_week_sessions), size=4, colour = "#AD181B") +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, max(ga_data_weekly$sessions +100))) +
+  default_theme
+
+ga_plot_weekly
+
+```
+
+<div class="my-footer-left"><img src="images/demystified.png" style="height: 22px;"/></div>
+<div class="my-footer-right">&#64;tgwilson</div>
+
+<!--
+And, generally, we include a trend of the data. This may show up as just a sparkline
+on a dashboard, but for our example here, we're showing it as a full chart. This is an
+example of a weekly report. The red dot shows the most recent week. We can see that the
+results were down for the week. But, was the data down just due to noise, or, rather, 
+does it seem that there is actually real movement in the metric that warrants additional
+exploration?
+-->
+
+
+## Let's break that weekly data down to be daily.
+
+```{r echo=FALSE, message=FALSE, warning = FALSE, fig.width = 8, fig.height = 4.75}
+
+# Build a plot showing just the actual data
+ga_plot <- ggplot(ga_data_plot, mapping = aes(x = time_period)) +
+  geom_line(aes(y = ga_data_plot$metric_all), color = "#07077D", size = 0.75) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, max_y)) +
+  default_theme
+
+ga_plot
+
+```
+
+<div class="my-footer-left"><img src="images/demystified.png" style="height: 22px;"/></div>
+<div class="my-footer-right">&#64;tgwilson</div>
+
+<!--
+The first thing we need to do is break the weekly data down into daily data. We can now see
+that the metric follows a pattern whereby it dips sharply on the weekends.
+-->
+
+
+## Last week is now the last 7 data points.
+
+```{r echo=FALSE, message=FALSE, warning = FALSE, fig.width = 8, fig.height = 4.75}
+
+# Same plot, but showing just the last week
+ga_plot <- ggplot(ga_data_plot, mapping = aes(x = time_period)) +
+  geom_line(aes(y = ga_data_plot$metric_all), color = "#07077D", size = 0.75) +
+  geom_vline(aes(xintercept = cutoff_time_period), 
+             color = "gray40", linetype = "dashed", size = 1) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, max_y)) +
+  default_theme
+
+ga_plot
+
+```
+
+<div class="my-footer-left"><img src="images/demystified.png" style="height: 22px;"/></div>
+<div class="my-footer-right">&#64;tgwilson</div>
+
+<!--
+We've gone from 7 weeks of data to 42 days of data.
+-->
+
+
+## We have the data of interest...
+
+```{r echo=FALSE, message=FALSE, warning = FALSE, fig.width = 8, fig.height = 4.75}
+
+# Same plot, with the "training data highlighted"data of interest highlighted
+ga_plot <- ggplot(ga_data_plot, mapping = aes(x = time_period)) +
+  geom_line(aes(y = ga_data_plot$metric_training), color = "gray80", size = 0.75) +
+  geom_line(aes(y = ga_data_plot$metric_assess), color = "#07077D", size = 0.75) +
+  geom_vline(aes(xintercept = cutoff_time_period), 
+             color = "gray40", linetype = "dashed", size = 1) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, max_y)) +
+  default_theme
+
+ga_plot
+
+```
+
+<div class="my-footer-left"><img src="images/demystified.png" style="height: 22px;"/></div>
+<div class="my-footer-right">&#64;tgwilson</div>
+
+<!--
+The last 7 data points are our data of interest.
+-->
+
+
+## ...and data for context.
+
+```{r echo=FALSE, message=FALSE, warning = FALSE, fig.width = 8, fig.height = 4.75}
+
+# Same plot, with the training data highlighted
+ga_plot <- ggplot(ga_data_plot, mapping = aes(x = time_period)) +
+  geom_line(aes(y = ga_data_plot$metric_training), color = "#07077D", size = 0.75) +
+  geom_line(aes(y = ga_data_plot$metric_assess), color = "gray80", size = 0.75) +
+  geom_vline(aes(xintercept = cutoff_time_period), 
+             color = "gray40", linetype = "dashed", size = 1) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, max_y)) +
+  default_theme
+
+ga_plot
+
+```
+
+<div class="my-footer-left"><img src="images/demystified.png" style="height: 22px;"/></div>
+<div class="my-footer-right">&#64;tgwilson</div>
+
+<!--
+And the preceding 42 data points are our data for context. The way we know that the most
+recent week was down is because we visually compared it to the preceding 6 weeks.
+-->
+
+
+## Let's take our context data...
+
+```{r echo=FALSE, message=FALSE, warning = FALSE, fig.width = 8, fig.height = 4.75}
+
+# Same plot, with the training data highlighted
+ga_plot <- ggplot(ga_data_plot, mapping = aes(x = time_period)) +
+  geom_line(aes(y = ga_data_plot$metric_training), color = "#07077D", size = 0.75) +
+  geom_vline(aes(xintercept = cutoff_time_period), 
+             color = "gray40", linetype = "dashed", size = 1) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, max_y)) +
+  default_theme
+
+ga_plot
+
+```
+
+<div class="my-footer-left"><img src="images/demystified.png" style="height: 22px;"/></div>
+<div class="my-footer-right">&#64;tgwilson</div>
+
+<!--
+Let's take our context data.
+-->
+
+
+## ...and think of it as "training" data.
+
+```{r echo=FALSE, message=FALSE, warning = FALSE, fig.width = 8, fig.height = 4.75}
+
+# Same plot, with the training data highlighted
+ga_plot <- ggplot(ga_data_plot, mapping = aes(x = time_period)) +
+  geom_line(aes(y = ga_data_plot$metric_training), color = "#07077D", size = 0.75) +
+  geom_vline(aes(xintercept = cutoff_time_period), 
+             color = "gray40", linetype = "dashed", size = 1) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, max_y)) +
+  default_theme
+
+ga_plot
+
+```
+
+<div class="my-footer-left"><img src="images/demystified.png" style="height: 22px;"/></div>
+<div class="my-footer-right">&#64;tgwilson</div>
+
+<!--
+And think of it as training data. We're going to use it to build a model using time-series
+decomposition as part of the Holt-Winters forecasting method.
+-->
+
+
+## We can "decompose" that data.
+
+```{r echo=FALSE, message=FALSE, warning = FALSE, fig.width = 8, fig.height = 4.75}
+
+# Decompose the time-series data
+ga_decomp <- decompose(ga_data_ts) 
+
+# Convert that to a long format data frame
+ga_decomp_df <- data.frame(
+  Actual = ga_decomp$x,
+  Seasonal = ga_decomp$seasonal,
+  Trend = ga_decomp$trend,
+  Random = ga_decomp$random) %>%
+  mutate(time_period = ga_data_training$time_period) %>%
+  gather(key, value, -time_period)
+
+# We want to control the order of the output, so make key a factor
+ga_decomp_df$key <- factor(ga_decomp_df$key,
+                           levels = c("Actual", "Seasonal", "Trend", "Random"))
+
+# The first plot will only show the Actual data. We'll build up each successive component
+# on subsequent slides.
+ga_decomp_df_plot <- ga_decomp_df %>%
+  mutate(value = ifelse(key == "Actual", value, NA))
+  
+# Plot the values
+ga_plot <- ggplot(ga_decomp_df_plot, mapping = aes(x = time_period, y = value)) +
+  geom_line() +
+  facet_grid(key ~ ., scales = "free", switch = "y") +
+  default_theme +
+  theme(panel.grid.major.y = element_blank())
+
+ga_plot
+
+```
+
+<div class="my-footer-left"><img src="images/demystified.png" style="height: 22px;"/></div>
+<div class="my-footer-right">&#64;tgwilson</div>
+
+<!--
+We start with our actual data. This is exactly what showed in the previous slide. It's just
+been squashed and stretched out a bit. We see that the data has a consistent weekly cycle.
+This cycle is seasonality. It's not an annual seasonality like we may be used to -- where
+there is back to school and holiday and so on -- but it is still seasonality. So, the first
+step in decomposing the data is to figure out the best fit for that weekly seasonality. In
+other words, what repeating pattern explains as much of the actual results as possible?
+-->
+
+
+## We can "decompose" that data.
+
+```{r echo=FALSE, message=FALSE, warning = FALSE, fig.width = 8, fig.height = 4.75}
+
+# The second plot will only show the Actual and Seasonal data. We'll build up each successive component
+# on subsequent slides.
+ga_decomp_df_plot <- ga_decomp_df %>%
+  mutate(value = ifelse(key == "Actual" | key == "Seasonal", value, NA))
+  
+# Plot the values
+ga_plot <- ggplot(ga_decomp_df_plot, mapping = aes(x = time_period, y = value)) +
+  geom_line() +
+  facet_grid(key ~ ., scales = "free", switch = "y") +
+  default_theme +
+  theme(panel.grid.major.y = element_blank())
+
+ga_plot
+
+```
+
+<div class="my-footer-left"><img src="images/demystified.png" style="height: 22px;"/></div>
+<div class="my-footer-right">&#64;tgwilson</div>
+
+<!--
+This is the seasonal component of the data. Notice how this is an exactly recurring pattern.
+Each Monday is exactly the same value. Each Tuesday is also exactly the same value -- a different
+value from Monday, but the same value for every Tuesday. 
+-->
+
+
+## We can "decompose" that data.
+
+```{r echo=FALSE, message=FALSE, warning = FALSE, fig.width = 8, fig.height = 4.75}
+
+# The third plot will only show the Actual, Seasonal, and Trend data. 
+ga_decomp_df_plot <- ga_decomp_df %>%
+  mutate(value = ifelse(key != "Random", value, NA))
+  
+# Plot the values
+ga_plot <- ggplot(ga_decomp_df_plot, mapping = aes(x = time_period, y = value)) +
+  geom_line() +
+  facet_grid(key ~ ., scales = "free", switch = "y") +
+  default_theme +
+  theme(panel.grid.major.y = element_blank())
+
+ga_plot
+
+```
+
+<div class="my-footer-left"><img src="images/demystified.png" style="height: 22px;"/></div>
+<div class="my-footer-right">&#64;tgwilson</div>
+
+<!--
+We can now subtract out this seasonal component from the actual values and apply 
+exponentional smoothing -- a moving average, essentially -- to get the trend component of the 
+data.
+-->
+
+
+## We can "decompose" that data.
+
+```{r echo=FALSE, message=FALSE, warning = FALSE, fig.width = 8, fig.height = 4.75}
+
+# The final plot will show all of the data.
+ga_decomp_df_plot <- ga_decomp_df 
+  
+# Plot the values
+ga_plot <- ggplot(ga_decomp_df_plot, mapping = aes(x = time_period, y = value)) +
+  geom_line() +
+  facet_grid(key ~ ., scales = "free", switch = "y") +
+  default_theme +
+  theme(panel.grid.major.y = element_blank())
+
+ga_plot
+
+```
+
+<div class="my-footer-left"><img src="images/demystified.png" style="height: 22px;"/></div>
+<div class="my-footer-right">&#64;tgwilson</div>
+
+<!--
+Finally, we take the seasonal value plus the trend value and subtract that from the actual value.
+What's left is the noise. Or, the random component of the signal. So, now, if we pick any date
+in this data set, we can add the seasonal value, the trend value, and the random value, and they
+will exactly total up to the actual value.
+
+With this decomposition, we can now use the first two components to build a forecase for the next
+seven days. The seasonal component is super easy, as we just repeat the pattern we established for
+another seven days. Extending the trend is a bit more involved, but we can see that there is a
+trend that we could fairly readily extend out for another seven days.
+-->
+
+
+## We can now build our forecast.
+
+```{r echo=FALSE, message=FALSE, warning = FALSE, fig.width = 8, fig.height = 4.75}
+
+# Same plot, with the training data highlighted
+ga_plot <- ggplot(ga_data_plot, mapping = aes(x = time_period)) +
+  geom_line(aes(y = ga_data_plot$metric_training), color = "#07077D", size = 0.75) +
+  geom_vline(aes(xintercept = cutoff_time_period), 
+             color = "gray40", linetype = "dashed", size = 1) +
+  geom_line(aes(y = ga_data_plot$fit), color = "gray50", linetype = "dotted", size = 1) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, max_y)) +
+  default_theme
+
+ga_plot
+
+```
+
+<div class="my-footer-left"><img src="images/demystified.png" style="height: 22px;"/></div>
+<div class="my-footer-right">&#64;tgwilson</div>
+
+<!--
+When we add the forecasts for the seasonal component and the trend component together, we
+get an overall forecast by day.
+-->
+
+
+## The forecast won't be perfect.
+
+```{r echo=FALSE, message=FALSE, warning = FALSE, fig.width = 8, fig.height = 4.75}
+
+# Same plot, with the forecasted value shown
+ga_plot <- ggplot(ga_data_plot, mapping = aes(x = time_period)) +
+  geom_line(aes(y = ga_data_plot$metric_training), color = "#07077D", size = 0.75) +
+  geom_vline(aes(xintercept = cutoff_time_period), 
+             color = "gray40", linetype = "dashed", size = 1) +
+  geom_line(aes(y = ga_data_plot$fit), color = "gray50", linetype = "dotted", size = 1) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, max_y)) +
+  default_theme
+
+ga_plot
+
+```
+
+<div class="my-footer-left"><img src="images/demystified.png" style="height: 22px;"/></div>
+<div class="my-footer-right">&#64;tgwilson</div>
+
+<!--
+We know the forecast will not be perfect. No forecast is. But, we can estimate how close to the
+actual results we expect the forecast to be by using the random component of the time-series
+decomposition we did earlier. If the random component did not vary that much from day to day,
+then we expect our forecast to be pretty close to the actual results. If it varied drastically,
+though, then we know that the actual results may differ quite a bit from our forecast. Essentially,
+we use that random component's variability to build a prediction interval.
+-->
+
+
+## So we add a prediction interval
+
+```{r echo=FALSE, message=FALSE, warning = FALSE, fig.width = 8, fig.height = 4.75}
+
+# Same plot, with the prediction interval added
+ga_plot <- ggplot(ga_data_plot, mapping = aes(x = time_period)) +
+  geom_ribbon(aes(ymin = ga_data_plot$lwr, ymax = ga_data_plot$upr), fill = "gray90") +
+  geom_line(aes(y = ga_data_plot$metric_training), color = "#07077D", size = 0.75) +
+  geom_vline(aes(xintercept = cutoff_time_period), 
+             color = "gray40", linetype = "dashed", size = 1) +
+  geom_line(aes(y = ga_data_plot$fit), color = "gray50", linetype = "dotted", size = 1) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, max_y)) +
+  default_theme
+
+ga_plot
+
+```
+
+<div class="my-footer-left"><img src="images/demystified.png" style="height: 22px;"/></div>
+<div class="my-footer-right">&#64;tgwilson</div>
+
+<!--
+This is a 95% prediction interval. A prediction interval is similar to a confidence interval. What
+the gray band represents is the range for which we expect, all things being stable, the actual 
+results to fall within 95% of the time.
+-->
+
+## We can compare!
+
+```{r echo=FALSE, message=FALSE, warning = FALSE, fig.width = 8, fig.height = 4.75}
+
+# Same plot, with the actuals shown
+ga_plot <- ggplot(ga_data_plot, mapping = aes(x = time_period)) +
+  geom_ribbon(aes(ymin = ga_data_plot$lwr, ymax = ga_data_plot$upr), fill = "gray90") +
+  geom_line(aes(y = ga_data_plot$metric_all), color = "#07077D", size = 0.75) +
+  geom_vline(aes(xintercept = cutoff_time_period), 
+             color = "gray40", linetype = "dashed", size = 1) +
+  geom_line(aes(y = ga_data_plot$fit), color = "gray50", linetype = "dotted", size = 1) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, max_y)) +
+  default_theme
+
+ga_plot
+
+```
+
+<div class="my-footer-left"><img src="images/demystified.png" style="height: 22px;"/></div>
+<div class="my-footer-right">&#64;tgwilson</div>
+
+<!--
+So, now, we add our actual results back onto the chart.
+-->
+
+
+## Now we have meaningful context! 
+
+```{r echo=FALSE, message=FALSE, warning = FALSE, fig.width = 8, fig.height = 4.75}
+
+ga_plot <- ggplot(ga_data_plot, mapping = aes(x = time_period)) +
+  geom_ribbon(aes(ymin = ga_data_plot$lwr, ymax = ga_data_plot$upr), fill = "gray90") +
+  geom_line(aes(y = ga_data_plot$metric_all), color = "#07077D", size = 0.75) +
+  geom_line(aes(y = ga_data_plot$fit), color = "gray50", linetype = "dotted", size = 1) +
+  geom_vline(aes(xintercept = cutoff_time_period), 
+             color = "gray40", linetype = "dashed", size = 1) +
+  geom_point(aes(y = ga_data_plot$anomaly), color = "#ED8E11", size = 2.5) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, max_y)) +
+  default_theme
+
+ga_plot
+
+```
+
+<div class="my-footer-left"><img src="images/demystified.png" style="height: 22px;"/></div>
+<div class="my-footer-right">&#64;tgwilson</div>
+
+<!--
+This provides meaningful context. We can see that, for 4 out of 5 weekdays last week, our actual
+results for the metric were below the 95% prediction interval for the data. It appears the results
+were likely not due just to noise. We likely should dig into this data to determine what the 
+root cause of the change was.
+
+And, that's really it. That's the Holt-Winters forecasting method explained at a high-level,
+as well as an illustration of it being put to use.
+
+If you are using Adobe Analytics, you have now just seen how their platform performs anomaly
+detection and how intelligent alerts work within the platform. Obviously, there are some nuances
+to their approach.
+-->
+
+
+
+# Thank You
+
+<!--
+I hope you have found this explanation helpful. Thank you.
+-->

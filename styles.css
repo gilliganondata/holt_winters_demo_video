@@ -1,0 +1,80 @@
+/*
+@import url(https://fonts.googleapis.com/css?family=Oswald);
+@import url(https://fonts.googleapis.com/css?family=Roboto);
+*?
+
+/* Adjust margin on title slide */
+.gdbar {
+  width: 400px !important;
+  height: 170px !important;
+}
+
+
+/* Set the body font to Roboto */
+body { font-family: 'Roboto';}
+
+h1 { font-family: 'Oswald';
+  font-size: 54px;
+  letter-spacing: 0px;
+}
+
+h2 { font-family: 'Oswald';
+  font-size: 42px;
+  letter-spacing: 0px;
+}
+
+h3 { font-family: 'Roboto';}
+
+.title-slide hgroup h1 {
+  font-size: 54px;
+  letter-spacing: -1px;
+}
+
+.title-slide hgroup h2 {
+  font-size: 34px;
+  letter-spacing: -1px;
+}
+
+.title-slide hgroup p {
+  font-family: 'Oswald';
+  font-size: 28px;
+  letter-spacing: 0px;
+}
+
+/* Turn off slide numbers */
+slides > slide:not(.nobackground):after {
+  content: '';
+}
+
+/* White slide background */
+slides > slide.backdrop {
+  background: white;
+}
+
+/* Reduce the crazy big left margin */
+.segue {
+  padding: 60px 60px;
+}
+
+.my-footer-left {
+    background-color: #FFFFFF;
+    position: absolute;
+    bottom: 30px;
+    left: 25px;
+    height: 10px;
+    width: 100%;
+}
+
+.my-footer-right {
+    background-color: #FFFFFF;
+    position: absolute;
+    bottom: 30px;
+    right: 25px;
+    height: 10px;
+    width: 50%;
+    text-align: right;
+    font-size: 12pt;
+    color: #BBBBBB;
+    font-family: 'Oswald';
+}
+
